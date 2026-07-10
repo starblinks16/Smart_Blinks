@@ -1,0 +1,6 @@
+{
+  "name": "SmartBlinks AI",
+  "description": "Futuristic autonomous AI trading platform for Gold (XAUUSD) powered by cTrader Open API and Gemini.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,19 @@
+[tool.poetry]
+name = "smartblinks-ai"
+version = "0.1.0"
+description = "Futuristic autonomous AI trading platform for Gold on cTrader"
+authors = ["SmartBlinks Team"]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+fastapi = "^0.110.0"
+uvicorn = "^0.28.0"
+websockets = "^12.0"
+requests = "^2.31.0"
+pydantic = "^2.6.0"
+google-genai = "^0.1.0"
+python-dotenv = "^1.0.1"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"

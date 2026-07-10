@@ -1,0 +1,11 @@
+modules = ["bash", "nodejs-20"]
+run = "bash run.sh"
+
+[entrypoint]
+entrypoint = "run.sh"
+
+[nix]
+channel = "stable-23_11"
+
+[replit.web]
+port = 8000
