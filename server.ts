@@ -50,7 +50,7 @@ export const config = {
   CTRADER_REDIRECT_URI: requireEnv("CTRADER_REDIRECT_URI"),
 
   // AUTH
-  CTRADER_AUTH_URL: "https://connect.spotware.com/apps/auth",
+  CTRADER_AUTH_URL: "https://id.ctrader.com/my/settings/openapi/grantingaccess",
 
   CTRADER_TOKEN_URL: "https://connect.spotware.com/apps/token",
 
@@ -829,7 +829,7 @@ app.get("/api/auth/url", (req, res) => {
   const state = Math.random().toString(36).substring(2, 15);
   
   // Construct the exact OAuth provider's auth URL using config values
-  const authUrl = `${config.CTRADER_AUTH_URL}?client_id=${clientId}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=code&scope=accounts%20trading`;
+  const authUrl = `${config.CTRADER_AUTH_URL}?client_id=${clientId}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=trading&product=web`;
   
   addExecutionLog("INFO", "AUTH URL GENERATED", `Authorization URL generated targeting: ${authUrl}`);
   res.json({ url: authUrl });
@@ -1034,13 +1034,18 @@ function getOAuthHtmlResponse(success: boolean, message: string): string {
       <div class="container">
         <h1>${success ? "Connection Secure" : "Link Aborted"}</h1>
         <p>${message}</p>
-        <button class="btn" onclick="window.close()">Close Window</button>
+        <button class="btn" onclick="if(window.opener){window.close();}else{window.location.href='/';}">${success ? "Return to Dashboard" : "Go Back"}</button>
       </div>
       <script>
         if (window.opener) {
           window.opener.postMessage({ type: 'OAUTH_AUTH_SUCCESS' }, '*');
           setTimeout(() => {
             window.close();
+          }, 1500);
+        } else {
+          // Same tab fallback: redirect to app root where app will auto-sync cTrader state
+          setTimeout(() => {
+            window.location.href = '/';
           }, 1500);
         }
       </script>

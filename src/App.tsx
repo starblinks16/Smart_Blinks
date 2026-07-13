@@ -233,20 +233,26 @@ export default function App() {
       }
       const { url } = data;
 
-      // Open OAuth directly in a centered popup
+      // Open OAuth directly in a centered popup or standard tab, fallback to same tab redirect if blocked
       const width = 600;
       const height = 700;
       const left = window.screen.width / 2 - width / 2;
       const top = window.screen.height / 2 - height / 2;
 
-      const authWindow = window.open(
-        url,
-        "ctrader_oauth_popup",
-        `width=${width},height=${height},left=${left},top=${top},scrollbars=yes,resizable=yes`
-      );
+      let authWindow: Window | null = null;
+      try {
+        authWindow = window.open(
+          url,
+          "ctrader_oauth_popup",
+          `width=${width},height=${height},left=${left},top=${top},scrollbars=yes,resizable=yes`
+        );
+      } catch (e) {
+        console.warn("Popup blocked or failed, falling back to same tab redirect:", e);
+      }
 
       if (!authWindow) {
-        alert("Security popup blocked. Please allow popups for SmartBlinks AI to authorize.");
+        // Fallback: Redirect the current tab to avoid any popup blocking
+        window.location.href = url;
       }
     } catch (e: any) {
       alert("cTrader Link Initiator Error: " + e.message);
