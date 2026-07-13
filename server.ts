@@ -1139,7 +1139,7 @@ function connectToCTraderWebSocket() {
         addExecutionLog(
           "WARNING",
           "Handshake Failed",
-          `Application Auth Failed: Check Client ID/Secret and cTrader Developer Portal settings. cTrader disconnected immediately (Code: ${code}, Reason: ${rsn || "None"}). This typically indicates: 1) Your cTrader Client ID or Client Secret is incorrect, 2) Your OpenAPI Application is not approved or is disabled on cTrader Developer Portal (https://openapi.ctrader.com), or 3) You are connecting to the wrong environment (Demo vs Live). Please check your Developer Credentials and settings.`
+          `Application Auth Failed: cTrader disconnected immediately (Code: ${code}, Reason: ${rsn || "None"}). Context: Client ID = "${cTraderSession ? cTraderSession.clientId : 'unknown'}", Environment = "${currentConnectedEnv || 'DEMO'}". This indicates cTrader rejected our ProtoOAApplicationAuthReq payload. Diagnostic: 1) Double-check that your Client ID and Secret are absolutely correct, 2) Ensure your cTrader OpenAPI Application is active and approved on https://openapi.ctrader.com, 3) Verify if your application type (Demo-only vs Live-only) matches your target environment (${currentConnectedEnv || 'DEMO'}).`
         );
         cTraderSession = null;
         isTokenValid = false;
@@ -1160,7 +1160,7 @@ function connectToCTraderWebSocket() {
 
     cTraderWebSocket.on("error", (err) => {
       cTraderWsStatus = "ERROR";
-      addExecutionLog("WARNING", "cTrader WS Error", `SSL stream experienced a failure: ${err.message}`);
+      addExecutionLog("WARNING", "cTrader WS Error", `SSL stream experienced a failure: ${err.message}. Connection target was: ${wsUrl}. This usually indicates a socket timeout, DNS failure, or the target server rejected the secure handshake.`);
     });
   } catch (err: any) {
     cTraderWsStatus = "ERROR";
@@ -1650,9 +1650,11 @@ function sendOaAppAuth() {
     const payloadBytes = lookupType("ProtoOAApplicationAuthReq").encode(authReq).finish();
     const framed = encodeFrame(payloadTypeEnum.OA_APPLICATION_AUTH_REQ, payloadBytes);
     
+    addExecutionLog("INFO", "App Auth Request Transmitted", `Transmitting ProtoOAApplicationAuthReq to cTrader. Client ID: ${cTraderSession.clientId} | Secret length: ${cTraderSession.clientSecret ? cTraderSession.clientSecret.length : 0} characters.`);
     cTraderWebSocket.send(framed);
   } catch (err: any) {
     console.error("Failed to build OA app auth req", err);
+    addExecutionLog("WARNING", "App Auth Build Error", `Failed to build ProtoOAApplicationAuthReq: ${err.message}`);
   }
 }
 
@@ -1667,9 +1669,11 @@ function sendOaAccountAuth() {
     const payloadBytes = lookupType("ProtoOAAccountAuthReq").encode(authReq).finish();
     const framed = encodeFrame(payloadTypeEnum.OA_ACCOUNT_AUTH_REQ, payloadBytes);
     
+    addExecutionLog("INFO", "Account Auth Request Transmitted", `Transmitting ProtoOAAccountAuthReq to cTrader. Account ID: ${cTraderSession.accountId} | Token length: ${cTraderSession.accessToken ? cTraderSession.accessToken.length : 0} characters.`);
     cTraderWebSocket.send(framed);
   } catch (err: any) {
     console.error("Failed to build account auth req", err);
+    addExecutionLog("WARNING", "Account Auth Build Error", `Failed to build ProtoOAAccountAuthReq: ${err.message}`);
   }
 }
 
@@ -1985,7 +1989,7 @@ function handleOaMessage(data: Buffer) {
           const errCode = errorRes.errorCode;
           const errMsg = errorRes.description || "Unknown cTrader OpenAPI error";
           const friendlyMessage = getFriendlyErrorMessage(errCode, errMsg);
-          addExecutionLog("WARNING", "cTrader Error Event", `cTrader returned error (${errCode}): ${friendlyMessage}`);
+          addExecutionLog("WARNING", "cTrader Error Event", `cTrader returned error (${errCode}): ${friendlyMessage} [Description: ${errMsg}]`);
 
           // Reset subsequent steps to prevent hanging UI trackers on fatal error
           syncState.accountDiscoverySuccess = false;
@@ -2009,6 +2013,29 @@ function handleOaMessage(data: Buffer) {
         } catch (decodeErr: any) {
           console.error("Failed to decode ProtoOAErrorRes", decodeErr);
         }
+        break;
+      }
+
+      case payloadTypeEnum.ERROR_RES: {
+        try {
+          const errorRes = lookupType("ProtoErrorRes").decode(frame.payload) as any;
+          const errCode = errorRes.errorCode;
+          const errMsg = errorRes.description || "General cTrader system error";
+          addExecutionLog("WARNING", "cTrader System Error", `cTrader returned system-level error code (${errCode}): ${errMsg}`);
+          addExecutionLog("WARNING", "Handshake Stuck Diagnostic", `FATAL SYSTEM ERROR FROM CTRADER DURING HANDSHAKE/STREAM: ${errCode} - ${errMsg}. Please verify that the Client ID, Client Secret, or access token are perfectly matched and have permissions for this chosen environment.`);
+          
+          cTraderConnStatus = "DISCONNECTED";
+          broadcastStateUpdate();
+        } catch (decodeErr: any) {
+          console.error("Failed to decode ProtoErrorRes", decodeErr);
+        }
+        break;
+      }
+
+      default: {
+        // Log generic incoming frames for maximum tracing
+        const payloadTypeName = Object.keys(payloadTypeEnum).find(k => (payloadTypeEnum as any)[k] === frame.payloadType) || "Unknown";
+        addExecutionLog("INFO", "cTrader Stream Received", `Received unhandled payload frame type: ${frame.payloadType} (${payloadTypeName}). Size: ${frame.payload.length} bytes.`);
         break;
       }
     }

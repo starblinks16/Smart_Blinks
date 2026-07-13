@@ -8,6 +8,7 @@ package cTrader;
 
 enum ProtoPayloadType {
     PROTO_MESSAGE = 50;
+    ERROR_RES = 51;
     PING_REQ = 52;
     PING_RES = 53;
     
@@ -39,6 +40,11 @@ message ProtoOAErrorRes {
     optional int64 ctidTraderAccountId = 1;
     required string errorCode = 2;
     optional string description = 3;
+}
+
+message ProtoErrorRes {
+    required string errorCode = 1;
+    optional string description = 2;
 }
 
 message ProtoMessage {
@@ -291,6 +297,7 @@ export function lookupType(name: string) {
 
 export const payloadTypeEnum = {
   PROTO_MESSAGE: 50,
+  ERROR_RES: 51,
   PING_REQ: 52,
   PING_RES: 53,
   OA_APPLICATION_AUTH_REQ: 2100,
