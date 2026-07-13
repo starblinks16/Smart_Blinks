@@ -65,6 +65,34 @@ export default function Connections({
     }
   }, [credentials.clientId]);
 
+  React.useEffect(() => {
+    const handleAuthMessage = async (event: MessageEvent) => {
+      const origin = event.origin;
+      if (!origin.endsWith(".run.app") && !origin.includes("localhost")) {
+        return;
+      }
+      if (event.data?.type === "OAUTH_AUTH_SUCCESS") {
+        try {
+          // Automatically trigger the backend's account discovery and stream connection immediately
+          await fetch("/api/ctrader/connect", { method: "POST" });
+        } catch (e) {
+          console.error("Failed to automatically trigger cTrader stream connection:", e);
+        }
+        try {
+          // Fetch updated state to synchronize the UI
+          await fetch("/api/state");
+        } catch (e) {
+          console.error("Failed to refresh state after authentication:", e);
+        }
+      }
+    };
+
+    window.addEventListener("message", handleAuthMessage);
+    return () => {
+      window.removeEventListener("message", handleAuthMessage);
+    };
+  }, []);
+
   const handleCopyCallback = () => {
     const callbackUrl = redirectUri || `${window.location.origin}/callback`;
     navigator.clipboard.writeText(callbackUrl).then(() => {

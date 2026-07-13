@@ -231,6 +231,7 @@ let cTraderAccounts: any[] = [];
 let currentConnectedEnv: "LIVE" | "DEMO" | null = null;
 let handshakeSequenceId = 0;
 let discoverySequenceStep = 0;
+let envSwitchCount = 0;
 
 // cTrader connection state
 let cTraderConnStatus: ConnectionStatus = "DISCONNECTED";
@@ -876,9 +877,9 @@ app.get(["/callback", "/callback/", "/api/ctrader/callback"], async (req, res) =
 
     const redirectUri = getRedirectUri(req);
 
-    addExecutionLog("INFO", "TOKEN EXCHANGE STARTED", "Starting server-side OAuth token exchange with cTrader OpenAPI...");
+    addExecutionLog("INFO", "TOKEN EXCHANGE STARTED", `Starting server-side OAuth token exchange with cTrader OpenAPI (POST) using redirect_uri: ${redirectUri}`);
 
-    // 2. cTrader OAuth GET request using configured Token URL
+    // 2. cTrader OAuth POST request using configured Token URL
     const tokenUrlParams = new URLSearchParams({
       grant_type: "authorization_code",
       code: authCode,
@@ -887,8 +888,12 @@ app.get(["/callback", "/callback/", "/api/ctrader/callback"], async (req, res) =
       client_secret: clientSecret
     });
 
-    const tokenResponse = await fetch(`${config.CTRADER_TOKEN_URL}?${tokenUrlParams.toString()}`, {
-      method: "GET"
+    const tokenResponse = await fetch(config.CTRADER_TOKEN_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded"
+      },
+      body: tokenUrlParams.toString()
     });
 
     if (!tokenResponse.ok) {
@@ -1110,27 +1115,29 @@ function connectToCTraderWebSocket() {
       syncState.realtimeSyncSuccess = false;
       syncState.balanceSyncSuccess = false;
       syncState.positionSyncSuccess = false;
-      cTraderConnStatus = "CONNECTING";
 
       const rsn = reason ? reason.toString() : "";
       if (!appAuthSuccessful) {
         addExecutionLog(
           "WARNING",
           "Handshake Failed",
-          `cTrader disconnected immediately (Code: ${code}, Reason: ${rsn || "None"}). This typically indicates: 1) Your cTrader Client ID or Client Secret is incorrect, 2) Your OpenAPI Application is not approved or is disabled on cTrader Developer Portal (https://openapi.ctrader.com), or 3) You are connecting to the wrong environment (Demo vs Live). Please check your Developer Credentials and settings.`
+          `Application Auth Failed: Check Client ID/Secret and cTrader Developer Portal settings. cTrader disconnected immediately (Code: ${code}, Reason: ${rsn || "None"}). This typically indicates: 1) Your cTrader Client ID or Client Secret is incorrect, 2) Your OpenAPI Application is not approved or is disabled on cTrader Developer Portal (https://openapi.ctrader.com), or 3) You are connecting to the wrong environment (Demo vs Live). Please check your Developer Credentials and settings.`
         );
         cTraderSession = null;
         isTokenValid = false;
         cTraderConnStatus = "DISCONNECTED";
+        broadcastStateUpdate();
+        return; // Halt here - do NOT trigger reconnection
       } else {
         addExecutionLog(
           "WARNING",
           "Connection Closed",
           `cTrader WebSocket stream closed (Code: ${code}, Reason: ${rsn || "None"}). Reconnecting...`
         );
+        cTraderConnStatus = "CONNECTING";
+        broadcastStateUpdate();
+        triggerWsReconnection();
       }
-
-      triggerWsReconnection();
     });
 
     cTraderWebSocket.on("error", (err) => {
@@ -1170,8 +1177,8 @@ function triggerWsReconnection() {
   }, delay);
 }
 
-// Query all linked accounts using ProtoOAGetAccountListByAccessTokenReq
-function sendOaGetAccountListByAccessTokenReq() {
+// Query all linked accounts under the current cTrader Access Token using ProtoOAGetAccountListByAccessTokenReq
+function sendOaGetAccounts() {
   if (!cTraderSession || !cTraderWebSocket) return;
   try {
     const getAccReq = {
@@ -1181,41 +1188,16 @@ function sendOaGetAccountListByAccessTokenReq() {
     const framed = encodeFrame(payloadTypeEnum.OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_REQ, payloadBytes);
     
     cTraderWebSocket.send(framed);
-    addExecutionLog("INFO", "Discovery Step 1", "Sending ProtoOAGetAccountListByAccessTokenReq sequentially...");
+    addExecutionLog("INFO", "Discovery Request", "Querying cTrader accounts using ProtoOAGetAccountListByAccessTokenReq...");
+    
+    // Set step sync status and broadcast to frontend
+    syncState.accountDiscoverySuccess = false;
+    syncState.accountMappingSuccess = false;
+    broadcastStateUpdate();
   } catch (err: any) {
     console.error("Failed to build ProtoOAGetAccountListByAccessTokenReq", err);
-    addExecutionLog("WARNING", "Discovery Step 1 Failed", `ProtoOAGetAccountListByAccessTokenReq failed: ${err.message}`);
+    addExecutionLog("WARNING", "Discovery Failed", `ProtoOAGetAccountListByAccessTokenReq failed: ${err.message}`);
   }
-}
-
-// Query all linked accounts using ProtoOAGetAccountsByAccessTokenReq
-function sendOaGetAccountsByAccessTokenReq() {
-  if (!cTraderSession || !cTraderWebSocket) return;
-  try {
-    const getAccReq = {
-      accessToken: cTraderSession.accessToken
-    };
-    const payloadBytes = lookupType("ProtoOAGetAccountsByAccessTokenReq").encode(getAccReq).finish();
-    const framed = encodeFrame(payloadTypeEnum.OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_REQ, payloadBytes);
-    
-    cTraderWebSocket.send(framed);
-    addExecutionLog("INFO", "Discovery Step 2", "Sending ProtoOAGetAccountsByAccessTokenReq sequentially...");
-  } catch (err: any) {
-    console.error("Failed to build ProtoOAGetAccountsByAccessTokenReq", err);
-    addExecutionLog("WARNING", "Discovery Step 2 Failed", `ProtoOAGetAccountsByAccessTokenReq failed: ${err.message}`);
-  }
-}
-
-// Sequence initiator: immediately executes both requests sequentially
-function runAutomatedAccountDiscoverySequence() {
-  addExecutionLog("INFO", "Discovery Sequence", "Initializing sequential automated cTrader account discovery...");
-  discoverySequenceStep = 1;
-  sendOaGetAccountListByAccessTokenReq();
-}
-
-// Query all linked accounts under the current cTrader Access Token (Now delegates to automated sequential discovery)
-function sendOaGetAccounts() {
-  runAutomatedAccountDiscoverySequence();
 }
 
 // Query specific details (balance, leverage, etc.) of target cTrader account
@@ -1706,25 +1688,13 @@ function handleOaMessage(data: Buffer) {
 
       case payloadTypeEnum.OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_RES: {
         let res: any;
-        let decodeSuccess = false;
-        
-        // Handle step-specific parsing
-        if (discoverySequenceStep === 2) {
+        try {
+          res = lookupType("ProtoOAGetAccountListByAccessTokenRes").decode(frame.payload) as any;
+        } catch (err: any) {
           try {
             res = lookupType("ProtoOAGetAccountsByAccessTokenRes").decode(frame.payload) as any;
-            decodeSuccess = true;
-            addExecutionLog("INFO", "Accounts Decoded (Step 2)", "Successfully decoded accounts payload via ProtoOAGetAccountsByAccessTokenRes.");
-          } catch (err) {
-            // fallback
-          }
-        }
-        
-        if (!decodeSuccess) {
-          try {
-            res = lookupType("ProtoOAGetAccountListByAccessTokenRes").decode(frame.payload) as any;
-            decodeSuccess = true;
-          } catch (err) {
-            addExecutionLog("WARNING", "Accounts Decode Error", "Could not decode accounts payload.");
+          } catch (fallbackErr: any) {
+            addExecutionLog("WARNING", "Accounts Decode Error", `Could not decode accounts payload: ${fallbackErr.message}`);
             break;
           }
         }
@@ -1738,27 +1708,13 @@ function handleOaMessage(data: Buffer) {
             traderLogin: acc.traderLogin ? String(acc.traderLogin) : ""
           }));
 
-          if (discoverySequenceStep === 1) {
-            cTraderAccounts = accountsList;
-            addExecutionLog("INFO", "Discovery Sequence", "Received ProtoOAGetAccountListByAccessTokenRes. Proceeding to ProtoOAGetAccountsByAccessTokenReq...");
-            discoverySequenceStep = 2;
-            sendOaGetAccountsByAccessTokenReq();
-            break; // Pause here until next response is processed
-          } else if (discoverySequenceStep === 2) {
-            // Merge lists cleanly
-            const existingIds = new Set(cTraderAccounts.map(a => a.accountId));
-            accountsList.forEach((acc: any) => {
-              if (!existingIds.has(acc.accountId)) {
-                cTraderAccounts.push(acc);
-              }
-            });
-            addExecutionLog("INFO", "Discovery Sequence Complete", `Successfully executed sequential discovery. Distinct accounts count: ${cTraderAccounts.length}`);
-            discoverySequenceStep = 0; // complete
-          } else {
-            cTraderAccounts = accountsList;
-          }
+          cTraderAccounts = accountsList;
 
+          // Step 3. Broker Discovery Success
+          syncState.oauthSuccess = true;
+          syncState.tokenExchangeSuccess = true;
           syncState.accountDiscoverySuccess = true;
+          broadcastStateUpdate();
 
           // Automatically select the first account matching the chosenAuthEnvironment, or fallback
           const targetIsLive = (chosenAuthEnvironment === "LIVE");
@@ -1772,7 +1728,9 @@ function handleOaMessage(data: Buffer) {
             addExecutionLog("INFO", "Automated Primary Selector", `Selected primary account: ${preferredAccount.accountId} (${preferredAccount.isLive ? "LIVE" : "DEMO"}-mode) automatically.`);
           }
 
+          // Step 4. Account Mapping Success
           syncState.accountMappingSuccess = true;
+          broadcastStateUpdate();
 
           // Detect if we need to switch WebSocket environment to match the target account environment (either LIVE or DEMO)
           const activeAccount = cTraderAccounts.find(a => a.accountId === cTraderSession!.accountId) || cTraderAccounts[0];
@@ -1780,24 +1738,35 @@ function handleOaMessage(data: Buffer) {
           const currentEnv = currentConnectedEnv || "LIVE";
           
           if (targetEnv !== currentEnv) {
-            addExecutionLog("INFO", "Switching Environment", `Account ${activeAccount.accountId} requires ${targetEnv} connection. Reconnecting to correct proxy...`);
-            cTraderSession!.environment = targetEnv;
-            cTraderSession!.tradeServerHost = targetEnv === "LIVE" ? "live.ctraderapi.com" : "demo.ctraderapi.com";
-            
-            if (cTraderWebSocket) {
-              cTraderWebSocket.removeAllListeners();
-              cTraderWebSocket.close();
-              cTraderWebSocket = null;
+            if (envSwitchCount >= 2) {
+              addExecutionLog("WARNING", "Switching Prevented", `Prevented infinite reconnection loop: already switched environments ${envSwitchCount} times. Staying on current connection.`);
+              envSwitchCount = 0;
+            } else {
+              envSwitchCount++;
+              addExecutionLog("INFO", "Switching Environment", `Account ${activeAccount.accountId} requires ${targetEnv} connection. Reconnecting to correct proxy (Switch attempt: ${envSwitchCount})...`);
+              cTraderSession!.environment = targetEnv;
+              cTraderSession!.tradeServerHost = targetEnv === "LIVE" ? "live.ctraderapi.com" : "demo.ctraderapi.com";
+              
+              if (cTraderWebSocket) {
+                cTraderWebSocket.removeAllListeners();
+                cTraderWebSocket.close();
+                cTraderWebSocket = null;
+              }
+              cTraderWsStatus = "CLOSED";
+              connectToCTraderWebSocket();
+              return;
             }
-            cTraderWsStatus = "CLOSED";
-            connectToCTraderWebSocket();
-            return;
+          } else {
+            envSwitchCount = 0; // Reset switch counter when environment is aligned
           }
           
           addExecutionLog("INFO", "Target Account Mapped", `Mapping streaming bot to account ID: ${cTraderSession!.accountId} (${targetEnv}).`);
           sendOaAccountAuth();
         } else {
           addExecutionLog("WARNING", "No Accounts Found", "This cTrader access token does not have any linked trading accounts.");
+          syncState.accountDiscoverySuccess = false;
+          syncState.accountMappingSuccess = false;
+          broadcastStateUpdate();
         }
         break;
       }
@@ -1806,6 +1775,7 @@ function handleOaMessage(data: Buffer) {
         syncState.wsAuthenticationSuccess = true;
         reconnectAttempts = 0; // Reset reconnect attempts only when full account sync/auth completes successfully
         addExecutionLog("INFO", "Account Stream Authorized", "Trading account successfully mapped and active. Syncing balance & positions.");
+        broadcastStateUpdate();
         sendOaTraderReq();
         sendOaReconcileReq();
         sendOaSymbolsListReq();
@@ -1825,6 +1795,8 @@ function handleOaMessage(data: Buffer) {
           }
         }
         subscribeToSpots();
+        syncState.realtimeSyncSuccess = true;
+        broadcastStateUpdate();
         break;
       }
 
@@ -1997,17 +1969,25 @@ function handleOaMessage(data: Buffer) {
           const friendlyMessage = getFriendlyErrorMessage(errCode, errMsg);
           addExecutionLog("WARNING", "cTrader Error Event", `cTrader returned error (${errCode}): ${friendlyMessage}`);
 
+          // Reset subsequent steps to prevent hanging UI trackers on fatal error
+          syncState.accountDiscoverySuccess = false;
+          syncState.accountMappingSuccess = false;
+          syncState.wsAuthenticationSuccess = false;
+          syncState.realtimeSyncSuccess = false;
+          syncState.balanceSyncSuccess = false;
+          syncState.positionSyncSuccess = false;
+          cTraderConnStatus = "DISCONNECTED";
+
           if (errCode === "CH_UNAUTHORIZED_EXPIRED_TOKEN" || errCode === "INVALID_ACCESS_TOKEN" || errCode === "OA_AUTH_ERROR" || errCode === "ACCESS_TOKEN_EXPIRED") {
             addExecutionLog("WARNING", "Token Expired", "Access token has expired or has been revoked by the broker. Demanding clean reauthorization.");
             isTokenValid = false;
             isTokenExpired = true;
             cTraderSession = null;
-            cTraderConnStatus = "DISCONNECTED";
             if (cTraderWebSocket) {
               cTraderWebSocket.close();
             }
-            broadcastStateUpdate();
           }
+          broadcastStateUpdate();
         } catch (decodeErr: any) {
           console.error("Failed to decode ProtoOAErrorRes", decodeErr);
         }
