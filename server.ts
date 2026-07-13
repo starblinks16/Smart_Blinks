@@ -67,6 +67,7 @@ const server = http.createServer(app);
 
 // Enable JSON parser for REST requests
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 // Mutex / Lock for Token Exchange to prevent duplicate / concurrent exchange attempts
 let tokenExchangeLock = false;
@@ -97,7 +98,7 @@ function getRedirectUri(req: any): string {
   // 1. Highest priority: configured/required CTRADER_REDIRECT_URI env var
   try {
     const configuredUri = config.CTRADER_REDIRECT_URI;
-    if (configuredUri && configuredUri !== "MY_CTRADER_REDIRECT_URI" && configuredUri !== "" && !configuredUri.includes("onrender.com") && !configuredUri.includes("render")) {
+    if (configuredUri && configuredUri !== "MY_CTRADER_REDIRECT_URI" && configuredUri !== "") {
       return configuredUri;
     }
   } catch (e) {
@@ -106,14 +107,8 @@ function getRedirectUri(req: any): string {
 
   // 2. High priority: Check process.env.PUBLIC_BASE_URL or process.env.APP_URL
   let baseUrl = process.env.PUBLIC_BASE_URL;
-  if (baseUrl && (baseUrl.includes("onrender.com") || baseUrl.includes("render"))) {
-    baseUrl = ""; // Discard render URLs as they are no longer useful
-  }
   if (!baseUrl || baseUrl === "MY_APP_URL" || baseUrl === "") {
     baseUrl = process.env.APP_URL;
-  }
-  if (baseUrl && (baseUrl.includes("onrender.com") || baseUrl.includes("render"))) {
-    baseUrl = ""; // Double check to discard render URLs
   }
 
   if (baseUrl && baseUrl !== "MY_APP_URL" && baseUrl !== "") {
@@ -840,13 +835,31 @@ app.get("/api/auth/url", (req, res) => {
   res.json({ url: authUrl });
 });
 
-// 2. Real OAuth Authorization Exchange (MUST be GET as requested)
-app.get(["/callback", "/callback/", "/api/ctrader/callback"], async (req, res) => {
-  addExecutionLog("INFO", "OAUTH REDIRECT RECEIVED", "OAuth redirect received on callback endpoint.");
-  const { code, state, error, error_description } = req.query;
+// 2. Real OAuth Authorization Exchange (Accepts GET and POST requests for safety)
+app.all(["/callback", "/callback/", "/api/ctrader/callback"], async (req, res) => {
+  const incomingUrl = req.originalUrl || req.url;
+  const headersStr = JSON.stringify(req.headers);
+  const queryStr = JSON.stringify(req.query);
+  const bodyStr = JSON.stringify(req.body);
+
+  console.log(`[DEBUG CALLBACK] Incoming Request: ${req.method} | URL: ${incomingUrl}`);
+  console.log(`[DEBUG CALLBACK] Query Parameters: ${queryStr}`);
+  console.log(`[DEBUG CALLBACK] Request Headers: ${headersStr}`);
+  console.log(`[DEBUG CALLBACK] Request Body: ${bodyStr}`);
+
+  addExecutionLog(
+    "INFO",
+    "OAUTH REDIRECT RECEIVED",
+    `OAuth redirect received. Method: ${req.method} | URL: ${incomingUrl} | Query: ${queryStr} | Body: ${bodyStr}`
+  );
+
+  const code = req.query.code || req.body?.code;
+  const state = req.query.state || req.body?.state;
+  const error = req.query.error || req.body?.error;
+  const error_description = req.query.error_description || req.body?.error_description || req.body?.errorDescription;
 
   if (error) {
-    return res.send(getOAuthHtmlResponse(false, `Authorization failed: ${error_description}`));
+    return res.send(getOAuthHtmlResponse(false, `Authorization failed: ${error_description || error}`));
   }
 
   if (!code) {
