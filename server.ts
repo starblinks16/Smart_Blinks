@@ -54,7 +54,7 @@ CTRADER_AUTH_URL: "https://connect.spotware.com/connect/authorize",
 CTRADER_TOKEN_URL: "https://connect.spotware.com/apps/token",
   // REAL OPEN API ENDPOINTS (current, as per official cTrader docs)
   // Use port 5035 for Protobuf, port 5036 for JSON.
-  CTRADER_DEMO: "demo.ctraderapi.com:5035",
+  CTRADER_DEMO_WSS: "wss://demo.ctraderapi.com:5035",
 
   CTRADER_LIVE_WSS: "wss://live.ctraderapi.com:5035",
 };
