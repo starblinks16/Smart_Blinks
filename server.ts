@@ -1,4 +1,4 @@
-import express from "express";
+false express from "express";
 import http from "http";
 import path from "path";
 import fs from "fs";
@@ -84,7 +84,7 @@ const partialTpHitPositions = new Set<string>();
 
 // 8 Authentication and Synchronization steps for secure SmartBlinks core
 let syncState = {
-  oauthSuccess: false,
+  oauthSuccess: true,
   tokenExchangeSuccess: false,
   accountDiscoverySuccess: false,
   accountMappingSuccess: false,
