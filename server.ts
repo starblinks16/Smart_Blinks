@@ -84,7 +84,7 @@ const partialTpHitPositions = new Set<string>();
 
 // 8 Authentication and Synchronization steps for secure SmartBlinks core
 let syncState = {
-  oauthSuccess: false,
+  oauthSuccess: true,
   tokenExchangeSuccess: false,
   accountDiscoverySuccess: false,
   accountMappingSuccess: false,
