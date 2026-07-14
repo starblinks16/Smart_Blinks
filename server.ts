@@ -50,7 +50,7 @@ export const config = {
   CTRADER_REDIRECT_URI: requireEnv("CTRADER_REDIRECT_URI"),
 
 // AUTH
-CTRADER_AUTH_URL: "https://connect.spotware.com/connect/authorize",
+CTRADER_AUTH_URL: "https://id.ctrader.com/my/settings/openapi/grantingaccess",
 CTRADER_TOKEN_URL: "https://connect.spotware.com/apps/token",
   // REAL OPEN API ENDPOINTS (current, as per official cTrader docs)
   // Use port 5035 for Protobuf, port 5036 for JSON.
