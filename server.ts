@@ -241,6 +241,7 @@ let isTokenValid = false;
 let isTokenExpired = false;
 let lastPingSentTime = 0;
 let lastHeartbeatReceivedTime = 0;
+let cTraderLastDirectError = "";
 
 // Initial candles are empty until synchronized with real cTrader Open API spot stream
 
@@ -522,7 +523,7 @@ function executeTrade(side: "BUY" | "SELL", lots: number, sl: number, tp: number
     const payloadBytes = lookupType("ProtoOANewOrderReq").encode(orderReq).finish();
     const framed = encodeFrame(payloadTypeEnum.OA_NEW_ORDER_REQ, payloadBytes);
     
-    cTraderWebSocket.send(framed);
+    sendFrame(framed, "ProtoOANewOrderReq");
     addExecutionLog(
       "TRADE_OPEN",
       `cTrader Core: ${side} Executed`,
@@ -554,7 +555,7 @@ function closePosition(id: string, reason: string) {
     };
     const payloadBytes = lookupType("ProtoOAClosePositionReq").encode(closeReq).finish();
     const framed = encodeFrame(payloadTypeEnum.OA_CLOSE_POSITION_REQ, payloadBytes);
-    cTraderWebSocket.send(framed);
+    sendFrame(framed, "ProtoOAClosePositionReq");
     addExecutionLog(
       "TRADE_CLOSE",
       "cTrader Core Close",
@@ -660,7 +661,8 @@ app.get("/api/state", (req, res) => {
     credentials: {
       clientId: getClientCredentials().clientId,
       clientSecret: getClientCredentials().clientSecret ? "••••••••" : "",
-      isConfigured: !!(getClientCredentials().clientId && getClientCredentials().clientSecret)
+      isConfigured: !!(getClientCredentials().clientId && getClientCredentials().clientSecret),
+      wsMode: process.env.CTRADER_WS_MODE || "demo"
     },
     cTraderAccounts,
     activeAccountId: cTraderSession?.accountId || "",
@@ -812,8 +814,14 @@ app.post("/api/ctrader/connect", (req, res) => {
 // 1. Generate cTrader Authorization Redirect URL
 app.get("/api/auth/url", (req, res) => {
   const { environment } = req.query;
-  if (environment === "LIVE" || environment === "DEMO") {
-    chosenAuthEnvironment = environment as "LIVE" | "DEMO";
+  let targetEnv = environment;
+  if (!targetEnv && process.env.CTRADER_WS_MODE) {
+    targetEnv = process.env.CTRADER_WS_MODE.toUpperCase() === "LIVE" ? "LIVE" : "DEMO";
+  }
+  if (targetEnv === "LIVE" || targetEnv === "DEMO") {
+    chosenAuthEnvironment = targetEnv as "LIVE" | "DEMO";
+  } else {
+    chosenAuthEnvironment = "DEMO";
   }
 
   const { clientId, clientSecret } = getClientCredentials();
@@ -1054,6 +1062,23 @@ function getOAuthHtmlResponse(success: boolean, message: string): string {
   `;
 }
 
+// Helper to send binary frames over cTrader WebSocket
+function sendFrame(framed: Uint8Array, messageName: string = "Frame") {
+  if (!cTraderWebSocket || cTraderWsStatus !== "OPEN") {
+    addExecutionLog("WARNING", "Transmission Skipped", `Cannot send ${messageName}: WebSocket is not open.`);
+    return;
+  }
+  try {
+    const hex = Buffer.from(framed).toString("hex").toUpperCase();
+    console.log(`[CTRADER SEND] ${messageName} (${framed.length} bytes): ${hex}`);
+    addExecutionLog("INFO", "Transmission Hex Dump", `[${messageName}] Sent ${framed.length} bytes. Hex payload: ${hex}`);
+    cTraderWebSocket.send(Buffer.from(framed), { binary: true });
+  } catch (err: any) {
+    console.error(`Failed to send ${messageName}:`, err);
+    addExecutionLog("WARNING", "Transmission Error", `Failed to send ${messageName}: ${err.message}`);
+  }
+}
+
 // cTrader real Proto WebSocket Connection Client
 function connectToCTraderWebSocket() {
   if (!cTraderSession || !cTraderSession.accessToken) {
@@ -1076,6 +1101,16 @@ function connectToCTraderWebSocket() {
   cTraderWsStatus = "CONNECTING";
   const environment = cTraderSession.environment || "DEMO";
   currentConnectedEnv = environment;
+  cTraderLastDirectError = ""; // Reset last cTrader direct error for the new connection sequence
+
+  const configuredWsMode = (process.env.CTRADER_WS_MODE || "demo").toUpperCase();
+  if (configuredWsMode !== environment) {
+    addExecutionLog(
+      "WARNING",
+      "Environment Mismatch Alert",
+      `YOUR SETTINGS MAY BE MISCONFIGURED! Credentials API Endpoint Mode is set to "${configuredWsMode}", but your target authorization environment is set to "${environment}". If you have a Demo application, make sure BOTH are set to Demo; if you have a Live application, ensure BOTH are set to Live.`
+    );
+  }
 
   let wsUrl = config.CTRADER_DEMO_WSS;
   if (cTraderSession.tradeServerHost) {
@@ -1136,10 +1171,35 @@ function connectToCTraderWebSocket() {
 
       const rsn = reason ? reason.toString() : "";
       if (!appAuthSuccessful) {
+        let directErrorContext = "";
+        if (cTraderLastDirectError) {
+          directErrorContext = `\n[DIRECT ERROR FROM CTRADER]: ${cTraderLastDirectError}`;
+        } else {
+          directErrorContext = `
+================================================================================
+[DIAGNOSTIC ANALYSIS - SILENT CONNECTION CLOSED BY CTRADER]
+No direct error frame was received from cTrader before the socket disconnected. This means cTrader closed the raw TCP/SSL stream immediately upon receiving our first payload.
+
+This is a signature cTrader OpenAPI behavior that occurs due to one of three reasons:
+
+1. ENVIRONMENT MISMATCH (Most Common):
+   - If your application "SmartBlinks" was created on the LIVE Open API Panel (openapi.ctrader.com), your Client ID and Client Secret only exist on the Live system. You MUST set your "API Endpoint Mode" in the credentials form to "Live" (live.ctraderapi.com:5035), EVEN IF you are trading or syncing a DEMO trading account!
+   - If your application was created on the SANDBOX Open API Panel (sandbox-openapi.ctrader.com), your credentials only exist on the Sandbox system. You MUST set your "API Endpoint Mode" to "Demo" (demo.ctraderapi.com:5035).
+   - Connecting to the Demo server (demo.ctraderapi.com) using Live credentials (or vice-versa) results in an immediate silent connection drop by cTrader.
+
+2. INVALID DEVELOPER CREDENTIALS:
+   - Double-check that your Client ID and Client Secret are copied exactly from your developer page (check for any copy-paste spaces).
+   - Ensure your application is approved and marked as "Active" on the cTrader developer portal.
+
+3. ACCESS RIGHTS OR TOKEN SCOPE:
+   - Ensure your token was granted with the required 'trading' scope.
+================================================================================`;
+        }
+
         addExecutionLog(
           "WARNING",
           "Handshake Failed",
-          `Application Auth Failed: cTrader disconnected immediately (Code: ${code}, Reason: ${rsn || "None"}). Context: Client ID = "${cTraderSession ? cTraderSession.clientId : 'unknown'}", Environment = "${currentConnectedEnv || 'DEMO'}". This indicates cTrader rejected our ProtoOAApplicationAuthReq payload. Diagnostic: 1) Double-check that your Client ID and Secret are absolutely correct, 2) Ensure your cTrader OpenAPI Application is active and approved on https://openapi.ctrader.com, 3) Verify if your application type (Demo-only vs Live-only) matches your target environment (${currentConnectedEnv || 'DEMO'}).`
+          `Application Auth Failed: cTrader disconnected immediately (Code: ${code}, Reason: ${rsn || "None"}). Context: Client ID = "${cTraderSession ? cTraderSession.clientId : 'unknown'}", Environment = "${currentConnectedEnv || 'DEMO'}".${directErrorContext}`
         );
         cTraderSession = null;
         isTokenValid = false;
@@ -1205,7 +1265,7 @@ function sendOaGetAccounts() {
     const payloadBytes = lookupType("ProtoOAGetAccountListByAccessTokenReq").encode(getAccReq).finish();
     const framed = encodeFrame(payloadTypeEnum.OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_REQ, payloadBytes);
     
-    cTraderWebSocket.send(framed);
+    sendFrame(framed, "ProtoOAGetAccountListByAccessTokenReq");
     addExecutionLog("INFO", "Discovery Request", "Querying cTrader accounts using ProtoOAGetAccountListByAccessTokenReq...");
     
     // Set step sync status and broadcast to frontend
@@ -1228,7 +1288,7 @@ function sendOaTraderReq() {
     const payloadBytes = lookupType("ProtoOATraderReq").encode(traderReq).finish();
     const framed = encodeFrame(payloadTypeEnum.OA_TRADER_REQ, payloadBytes);
     
-    cTraderWebSocket.send(framed);
+    sendFrame(framed, "ProtoOATraderReq");
   } catch (err: any) {
     console.error("Failed to build trader req", err);
   }
@@ -1244,7 +1304,7 @@ function sendOaReconcileReq() {
     const payloadBytes = lookupType("ProtoOAReconcileReq").encode(reconcileReq).finish();
     const framed = encodeFrame(payloadTypeEnum.OA_RECONCILE_REQ, payloadBytes);
     
-    cTraderWebSocket.send(framed);
+    sendFrame(framed, "ProtoOAReconcileReq");
   } catch (err: any) {
     console.error("Failed to build reconcile req", err);
   }
@@ -1261,7 +1321,7 @@ function sendOaSymbolsListReq() {
     const payloadBytes = lookupType("ProtoOASymbolsListReq").encode(symbolsReq).finish();
     const framed = encodeFrame(payloadTypeEnum.OA_SYMBOLS_LIST_REQ, payloadBytes);
     
-    cTraderWebSocket.send(framed);
+    sendFrame(framed, "ProtoOASymbolsListReq");
     addExecutionLog("INFO", "Fetching Symbols", "Mapping cTrader asset IDs dynamically for precise trading.");
   } catch (err: any) {
     console.error("Failed to build symbols list req", err);
@@ -1277,7 +1337,7 @@ function sendOaPing() {
     };
     const payloadBytes = lookupType("ProtoPingReq").encode(pingReq).finish();
     const framed = encodeFrame(payloadTypeEnum.PING_REQ, payloadBytes);
-    cTraderWebSocket.send(framed);
+    sendFrame(framed, "ProtoPingReq");
     lastPingSentTime = Date.now();
     broadcastStateUpdate();
   } catch (err: any) {
@@ -1503,7 +1563,7 @@ function processStagedTrailing(pos: Position) {
         };
         const payloadBytes = lookupType("ProtoOAModifyPositionSLTPReq").encode(modifyReq).finish();
         const framed = encodeFrame(payloadTypeEnum.OA_MODIFY_POSITION_SL_TP_REQ, payloadBytes);
-        cTraderWebSocket.send(framed);
+        sendFrame(framed, "ProtoOAModifyPositionSLTPReq");
       } catch (err: any) {
         console.error("Failed to transmit cTrader SL modification:", err);
       }
@@ -1534,7 +1594,7 @@ function processPartialTakeProfit(pos: Position) {
         };
         const payloadBytes = lookupType("ProtoOAClosePositionReq").encode(closeReq).finish();
         const framed = encodeFrame(payloadTypeEnum.OA_CLOSE_POSITION_REQ, payloadBytes);
-        cTraderWebSocket.send(framed);
+        sendFrame(framed, "ProtoOAClosePositionReq");
       } catch (err: any) {
         console.error("Partial close request failed:", err);
       }
@@ -1651,7 +1711,7 @@ function sendOaAppAuth() {
     const framed = encodeFrame(payloadTypeEnum.OA_APPLICATION_AUTH_REQ, payloadBytes);
     
     addExecutionLog("INFO", "App Auth Request Transmitted", `Transmitting ProtoOAApplicationAuthReq to cTrader. Client ID: ${cTraderSession.clientId} | Secret length: ${cTraderSession.clientSecret ? cTraderSession.clientSecret.length : 0} characters.`);
-    cTraderWebSocket.send(framed);
+    sendFrame(framed, "ProtoOAApplicationAuthReq");
   } catch (err: any) {
     console.error("Failed to build OA app auth req", err);
     addExecutionLog("WARNING", "App Auth Build Error", `Failed to build ProtoOAApplicationAuthReq: ${err.message}`);
@@ -1670,7 +1730,7 @@ function sendOaAccountAuth() {
     const framed = encodeFrame(payloadTypeEnum.OA_ACCOUNT_AUTH_REQ, payloadBytes);
     
     addExecutionLog("INFO", "Account Auth Request Transmitted", `Transmitting ProtoOAAccountAuthReq to cTrader. Account ID: ${cTraderSession.accountId} | Token length: ${cTraderSession.accessToken ? cTraderSession.accessToken.length : 0} characters.`);
-    cTraderWebSocket.send(framed);
+    sendFrame(framed, "ProtoOAAccountAuthReq");
   } catch (err: any) {
     console.error("Failed to build account auth req", err);
     addExecutionLog("WARNING", "Account Auth Build Error", `Failed to build ProtoOAAccountAuthReq: ${err.message}`);
@@ -1699,7 +1759,12 @@ function getFriendlyErrorMessage(errCode: string, description: string): string {
 function handleOaMessage(data: Buffer) {
   try {
     const binary = new Uint8Array(data);
+    const hex = Buffer.from(binary).toString("hex").toUpperCase();
+    console.log(`[CTRADER RECV] Raw data (${binary.length} bytes): ${hex}`);
+    
     const frame = decodeFrame(binary);
+    console.log(`[CTRADER RECV] Decoded Frame. payloadType: ${frame.payloadType}, clientMsgId: ${frame.clientMsgId || "none"}`);
+    addExecutionLog("INFO", "Reception Hex Dump", `Received ${binary.length} bytes. payloadType: ${frame.payloadType}. Hex: ${hex}`);
 
     switch (frame.payloadType) {
       case payloadTypeEnum.OA_APPLICATION_AUTH_RES:
@@ -1989,6 +2054,9 @@ function handleOaMessage(data: Buffer) {
           const errCode = errorRes.errorCode;
           const errMsg = errorRes.description || "Unknown cTrader OpenAPI error";
           const friendlyMessage = getFriendlyErrorMessage(errCode, errMsg);
+          
+          cTraderLastDirectError = `Error Code: "${errCode}" | Description: "${errMsg}" | Diagnostic: "${friendlyMessage}"`;
+          
           addExecutionLog("WARNING", "cTrader Error Event", `cTrader returned error (${errCode}): ${friendlyMessage} [Description: ${errMsg}]`);
 
           // Reset subsequent steps to prevent hanging UI trackers on fatal error
@@ -2021,6 +2089,9 @@ function handleOaMessage(data: Buffer) {
           const errorRes = lookupType("ProtoErrorRes").decode(frame.payload) as any;
           const errCode = errorRes.errorCode;
           const errMsg = errorRes.description || "General cTrader system error";
+          
+          cTraderLastDirectError = `System Error Code: "${errCode}" | Description: "${errMsg}"`;
+          
           addExecutionLog("WARNING", "cTrader System Error", `cTrader returned system-level error code (${errCode}): ${errMsg}`);
           addExecutionLog("WARNING", "Handshake Stuck Diagnostic", `FATAL SYSTEM ERROR FROM CTRADER DURING HANDSHAKE/STREAM: ${errCode} - ${errMsg}. Please verify that the Client ID, Client Secret, or access token are perfectly matched and have permissions for this chosen environment.`);
           
@@ -2055,7 +2126,7 @@ function subscribeToSpots() {
     const payloadBytes = lookupType("ProtoOASubscribeSpotsReq").encode(subscribeReq).finish();
     const framed = encodeFrame(payloadTypeEnum.OA_SUBSCRIBE_SPOTS_REQ, payloadBytes);
     
-    cTraderWebSocket.send(framed);
+    sendFrame(framed, "ProtoOASubscribeSpotsReq");
     addExecutionLog("INFO", "Tick Feed Subscribed", "Listening to real-time spot Gold (XAUUSD) quotes directly from cTrader broker.");
   } catch (err: any) {
     console.error("Failed to compile spots subscription req", err);

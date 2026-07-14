@@ -9,6 +9,7 @@ interface ConnectionsProps {
     clientId: string;
     clientSecret: string;
     isConfigured: boolean;
+    wsMode?: string;
   };
   cTraderAccounts?: Array<{ accountId: string; isLive: boolean; traderLogin: string }>;
   activeAccountId?: string;
@@ -63,7 +64,10 @@ export default function Connections({
     if (credentials.clientId) {
       setClientIdInput(credentials.clientId);
     }
-  }, [credentials.clientId]);
+    if (credentials.wsMode) {
+      setWsMode(credentials.wsMode as "live" | "demo");
+    }
+  }, [credentials.clientId, credentials.wsMode]);
 
   React.useEffect(() => {
     const handleAuthMessage = async (event: MessageEvent) => {
