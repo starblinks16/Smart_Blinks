@@ -1167,15 +1167,20 @@ function getOAuthHtmlResponse(success: boolean, message: string): string {
 
 // Helper to send binary frames over cTrader WebSocket
 function sendFrame(framed: Uint8Array, messageName: string = "Frame") {
-  if (!cTraderWebSocket || cTraderWsStatus !== "OPEN") {
-    addExecutionLog("WARNING", "Transmission Skipped", `Cannot send ${messageName}: WebSocket is not open.`);
+  if (!cTraderWebSocket || cTraderWebSocket.readyState !== WebSocket.OPEN) {
+    addExecutionLog("WARNING", "Transmission Skipped", `Cannot send ${messageName}: WebSocket is not open (readyState: ${cTraderWebSocket ? cTraderWebSocket.readyState : 'none'}).`);
     return;
   }
   try {
     const hex = Buffer.from(framed).toString("hex").toUpperCase();
     console.log(`[CTRADER SEND] ${messageName} (${framed.length} bytes): ${hex}`);
     addExecutionLog("INFO", "Transmission Hex Dump", `[${messageName}] Sent ${framed.length} bytes. Hex payload: ${hex}`);
-    cTraderWebSocket.send(Buffer.from(framed), { binary: true });
+    cTraderWebSocket.send(Buffer.from(framed), { binary: true }, (err) => {
+      if (err) {
+        console.error(`[CTRADER SEND ERROR] Failed to send ${messageName}:`, err);
+        addExecutionLog("WARNING", "Transmission Error", `Failed to send ${messageName}: ${err.message}`);
+      }
+    });
   } catch (err: any) {
     console.error(`Failed to send ${messageName}:`, err);
     addExecutionLog("WARNING", "Transmission Error", `Failed to send ${messageName}: ${err.message}`);
@@ -1193,12 +1198,14 @@ function connectToCTraderWebSocket() {
   // Clean up any existing WebSocket first to prevent lingering event handlers from triggering
   if (cTraderWebSocket) {
     try {
-      cTraderWebSocket.removeAllListeners();
-      cTraderWebSocket.close();
+      const oldSocket = cTraderWebSocket;
+      cTraderWebSocket = null;
+      // Add error listener to capture and ignore socket teardown errors gracefully, then close
+      oldSocket.on("error", () => {});
+      oldSocket.close();
     } catch (e) {
       console.error("Error closing old cTrader WebSocket:", e);
     }
-    cTraderWebSocket = null;
   }
 
   cTraderWsStatus = "CONNECTING";
@@ -2202,6 +2209,9 @@ function subscribeToSpots() {
 
 // WebSocket connection to frontend
 const wss = new WebSocketServer({ noServer: true });
+wss.on("error", (err) => {
+  console.error("[WSS SERVER ERROR]", err);
+});
 wss.on("connection", (ws: WebSocket) => {
   wsClients.push(ws);
   
