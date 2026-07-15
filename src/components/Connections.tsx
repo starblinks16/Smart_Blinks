@@ -59,6 +59,28 @@ export default function Connections({
   const [copied, setCopied] = useState(false);
   const [authEnv, setAuthEnv] = useState<"DEMO" | "LIVE">("DEMO");
   const [wsMode, setWsMode] = useState<"live" | "demo">("demo");
+  const [isConnectingStream, setIsConnectingStream] = useState(false);
+
+  const handleConnectStream = async () => {
+    setIsConnectingStream(true);
+    setErrorText("");
+    try {
+      const res = await fetch("/api/ctrader/connect", { method: "POST" });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Failed to initiate stream link");
+      
+      // Delay slightly and refresh the state
+      setTimeout(async () => {
+        try {
+          await fetch("/api/state");
+        } catch (e) {}
+      }, 1500);
+    } catch (e: any) {
+      setErrorText(e.message || "Failed to trigger connect");
+    } finally {
+      setIsConnectingStream(false);
+    }
+  };
 
   React.useEffect(() => {
     if (credentials.clientId) {
@@ -308,9 +330,35 @@ export default function Connections({
               </div>
             ) : (
               <div className="bg-gray-950/40 border border-gray-800/35 p-6 rounded-lg text-center space-y-4">
-                <div className="text-gray-500 text-xs font-sans">No active cTrader broker link. SmartBlinks engine requires a direct Open API connection.</div>
+                <div className="text-gray-500 text-xs font-sans mb-2">
+                  {diagnostics?.authorized 
+                    ? "cTrader authorization validated, but secure real-time stream is offline." 
+                    : "No active cTrader broker link. SmartBlinks engine requires a direct Open API connection."}
+                </div>
                 
-                {credentials.isConfigured ? (
+                {diagnostics?.authorized ? (
+                  <div className="flex flex-col items-center justify-center space-y-4 max-w-sm mx-auto p-4 bg-emerald-500/5 rounded-lg border border-emerald-500/10">
+                    <div className="text-emerald-400 text-xs font-sans font-bold flex items-center space-x-2">
+                      <CheckCircle size={14} className="text-emerald-400" />
+                      <span>ACCESS TOKEN ACTIVE & SECURED</span>
+                    </div>
+                    <p className="text-[11px] text-gray-400 leading-relaxed text-center">
+                      Your OAuth access session is active in the server. Activate the direct binary stream below to start synchronizing quotes and trading.
+                    </p>
+                    <button
+                      id="btn-connect-stream"
+                      onClick={handleConnectStream}
+                      disabled={isConnectingStream}
+                      className="w-full bg-gradient-to-r from-emerald-500/20 to-emerald-600/15 border border-emerald-500/30 hover:border-emerald-400 text-emerald-400 px-6 py-2.5 rounded-lg text-xs font-bold font-sans transition-all duration-200 cursor-pointer shadow-lg flex items-center justify-center space-x-2 disabled:opacity-50"
+                    >
+                      <span>{isConnectingStream ? "CONNECTING STREAM..." : "ACTIVATE STREAM CONNECTOR"}</span>
+                      <RefreshCw size={14} className={isConnectingStream ? "animate-spin" : ""} />
+                    </button>
+                    <div className="text-[10px] text-gray-500 leading-relaxed text-center italic">
+                      Note: Verify your "API Endpoint Mode" below perfectly matches your application environment (Live vs Demo) before clicking.
+                    </div>
+                  </div>
+                ) : credentials.isConfigured ? (
                   <div className="flex flex-col items-center justify-center space-y-4 max-w-sm mx-auto">
                     <div className="flex items-center space-x-2 w-full">
                       <span className="text-[10px] font-mono text-gray-500 uppercase tracking-wider whitespace-nowrap">Auth Env:</span>

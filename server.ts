@@ -49,9 +49,11 @@ export const config = {
 
   CTRADER_REDIRECT_URI: requireEnv("CTRADER_REDIRECT_URI"),
 
-// AUTH
-CTRADER_AUTH_URL: "https://id.ctrader.com/my/settings/openapi/grantingaccess",
-CTRADER_TOKEN_URL: "https://connect.spotware.com/apps/token",
+  // AUTH
+  CTRADER_AUTH_URL: "https://id.ctrader.com/my/settings/openapi/grantingaccess",
+
+  CTRADER_TOKEN_URL: "https://connect.spotware.com/apps/token",
+
   // REAL OPEN API ENDPOINTS (current, as per official cTrader docs)
   // Use port 5035 for Protobuf, port 5036 for JSON.
   CTRADER_DEMO_WSS: "wss://demo.ctraderapi.com:5035",
@@ -149,6 +151,7 @@ function resetSyncState() {
   lastPingSentTime = 0;
   lastHeartbeatReceivedTime = 0;
   cTraderSession = null;
+  saveSession();
 }
 
 function checkAllStepsSynced() {
@@ -218,6 +221,91 @@ let cTraderSession: {
   tradeServerHost?: string;
   tradeServerPort?: number;
 } | null = null;
+
+const SESSION_FILE = path.join(process.cwd(), "ctrader_session.json");
+const CONFIG_FILE = path.join(process.cwd(), "ctrader_config.json");
+
+function saveCredentialsConfig(clientId: string, clientSecret: string, wsMode: string) {
+  try {
+    fs.writeFileSync(CONFIG_FILE, JSON.stringify({ clientId, clientSecret, wsMode }, null, 2));
+    console.log("[CONFIG] Saved developer credentials configuration.");
+  } catch (e) {
+    console.error("[CONFIG] Failed to save developer credentials:", e);
+  }
+}
+
+function loadCredentialsConfig() {
+  try {
+    if (fs.existsSync(CONFIG_FILE)) {
+      const data = JSON.parse(fs.readFileSync(CONFIG_FILE, "utf-8"));
+      if (data) {
+        if (data.clientId && !process.env.CTRADER_CLIENT_ID) {
+          process.env.CTRADER_CLIENT_ID = data.clientId;
+        }
+        if (data.clientSecret && !process.env.CTRADER_CLIENT_SECRET) {
+          process.env.CTRADER_CLIENT_SECRET = data.clientSecret;
+        }
+        if (data.wsMode && !process.env.CTRADER_WS_MODE) {
+          process.env.CTRADER_WS_MODE = data.wsMode;
+        }
+        console.log("[CONFIG] Restored cTrader developer configuration from file.");
+      }
+    }
+  } catch (e) {
+    console.error("[CONFIG] Failed to load developer credentials:", e);
+  }
+}
+
+function saveSession() {
+  if (cTraderSession) {
+    try {
+      fs.writeFileSync(SESSION_FILE, JSON.stringify({
+        cTraderSession,
+        isTokenValid,
+        isTokenExpired
+      }, null, 2));
+    } catch (e) {
+      console.error("[SESSION] Failed to save cTrader session:", e);
+    }
+  } else {
+    try {
+      if (fs.existsSync(SESSION_FILE)) {
+        fs.unlinkSync(SESSION_FILE);
+      }
+    } catch (e) {}
+  }
+}
+
+function loadSession() {
+  try {
+    if (fs.existsSync(SESSION_FILE)) {
+      const data = JSON.parse(fs.readFileSync(SESSION_FILE, "utf-8"));
+      if (data && data.cTraderSession) {
+        cTraderSession = data.cTraderSession;
+        isTokenValid = data.isTokenValid !== undefined ? data.isTokenValid : true;
+        isTokenExpired = data.isTokenExpired !== undefined ? data.isTokenExpired : false;
+        
+        console.log("[SESSION] Restored cTrader access link for client:", cTraderSession.clientId.substring(0, 8));
+        
+        // Ensure memory-based process.env variables are populated from the restored session
+        if (cTraderSession.clientId && !process.env.CTRADER_CLIENT_ID) {
+          process.env.CTRADER_CLIENT_ID = cTraderSession.clientId;
+        }
+        if (cTraderSession.clientSecret && !process.env.CTRADER_CLIENT_SECRET) {
+          process.env.CTRADER_CLIENT_SECRET = cTraderSession.clientSecret;
+        }
+        
+        // Auto-connect to cTrader WS on startup if session exists
+        setTimeout(() => {
+          addExecutionLog("INFO", "Session Restored", `Restored saved cTrader access link for client: ${cTraderSession!.clientId.substring(0, 8)}... Account ID: ${cTraderSession!.accountId || "discovery pending"}. Initializing auto-connection...`);
+          connectToCTraderWebSocket();
+        }, 3000);
+      }
+    }
+  } catch (e) {
+    console.error("[SESSION] Failed to load cTrader session:", e);
+  }
+}
 
 let goldSymbolId = 1n;
 let cTraderAccounts: any[] = [];
@@ -631,7 +719,11 @@ function broadcastToFrontend(payload: { type: string; data: any }) {
   const jsonStr = JSON.stringify(payload);
   wsClients.forEach((client) => {
     if (client.readyState === WebSocket.OPEN) {
-      client.send(jsonStr);
+      try {
+        client.send(jsonStr);
+      } catch (err) {
+        console.error("[WS CLIENT BROADCAST ERROR]", err);
+      }
     }
   });
 }
@@ -735,14 +827,20 @@ app.post("/api/trading/account", (req, res) => {
   cTraderSession.environment = targetAcc.isLive ? "LIVE" : "DEMO";
   addExecutionLog("INFO", "Active Account Selected", `User switched active trade sync to account: ${targetAcc.accountId} (${targetAcc.isLive ? "LIVE" : "DEMO"})`);
 
-  // Reconnect with target account and appropriate environment
-  if (cTraderWebSocket) {
-    cTraderWebSocket.removeAllListeners();
-    cTraderWebSocket.close();
-    cTraderWebSocket = null;
+  // Send active account auth directly on the existing connection or reconnect if closed
+  if (cTraderWebSocket && cTraderWsStatus === "OPEN") {
+    // Reset specific states
+    syncState.wsAuthenticationSuccess = false;
+    syncState.realtimeSyncSuccess = false;
+    syncState.balanceSyncSuccess = false;
+    syncState.positionSyncSuccess = false;
+    broadcastStateUpdate();
+    
+    addExecutionLog("INFO", "Direct Account Switched", `Activating direct account authorization for: ${targetAcc.accountId} over active WebSocket.`);
+    sendOaAccountAuth();
+  } else {
+    connectToCTraderWebSocket();
   }
-  cTraderWsStatus = "CLOSED";
-  connectToCTraderWebSocket();
 
   res.json({ status: "success", accountId: targetAcc.accountId });
 });
@@ -779,17 +877,21 @@ function getClientCredentials() {
   return { clientId: clientId.trim(), clientSecret: clientSecret.trim() };
 }
 
-// Register developer credentials dynamically in memory
+// Register developer credentials dynamically in memory and persist them to file
 app.post("/api/credentials", (req, res) => {
   const { clientId, clientSecret, wsMode } = req.body;
   process.env.CTRAPID_MODE = wsMode; // preserve
-  process.env.CTRADER_CLIENT_ID = (clientId || "").trim();
-  process.env.CTRADER_CLIENT_SECRET = (clientSecret || "").trim();
-  if (wsMode) {
-    process.env.CTRADER_WS_MODE = wsMode;
-  }
+  const trimmedClientId = (clientId || "").trim();
+  const trimmedClientSecret = (clientSecret || "").trim();
+  const activeWsMode = wsMode || "demo";
+
+  process.env.CTRADER_CLIENT_ID = trimmedClientId;
+  process.env.CTRADER_CLIENT_SECRET = trimmedClientSecret;
+  process.env.CTRADER_WS_MODE = activeWsMode;
   
-  addExecutionLog("INFO", "Credentials Registered", `Real-time cTrader OpenAPI developer credentials successfully registered in memory. API Endpoint Mode set to: ${wsMode || "demo"}.`);
+  saveCredentialsConfig(trimmedClientId, trimmedClientSecret, activeWsMode);
+  
+  addExecutionLog("INFO", "Credentials Registered", `Real-time cTrader OpenAPI developer credentials successfully registered and persisted. API Endpoint Mode set to: ${activeWsMode}.`);
   res.json({ status: "success" });
 });
 
@@ -937,7 +1039,8 @@ app.all(["/callback", "/callback/", "/api/ctrader/callback"], async (req, res) =
 
     // Automate session initialization using direct WebSocket and Protobuf sequence!
     const isLiveTarget = (chosenAuthEnvironment === "LIVE");
-    const initialHost = isLiveTarget ? "live.ctraderapi.com" : "demo.ctraderapi.com";
+    const configuredWsMode = (process.env.CTRADER_WS_MODE || "demo").toLowerCase();
+    const initialHost = configuredWsMode === "live" ? "live.ctraderapi.com" : "demo.ctraderapi.com";
 
     // Setup cTrader session with empty accountId to trigger auto-discovery over WebSocket
     cTraderSession = {
@@ -950,6 +1053,8 @@ app.all(["/callback", "/callback/", "/api/ctrader/callback"], async (req, res) =
       tradeServerHost: initialHost,
       tradeServerPort: 5035
     };
+
+    saveSession();
 
     addExecutionLog("INFO", "SESSION INITIALIZED", `Token secured. Launching automated WebSocket handshake to wss://${initialHost}:5035 to execute ProtoOAGetAccountListByAccessTokenReq...`);
 
@@ -1097,26 +1202,14 @@ function connectToCTraderWebSocket() {
   }
 
   cTraderWsStatus = "CONNECTING";
-  const environment = cTraderSession.environment || "DEMO";
+  appAuthSuccessful = false; // Reset to false before connection starts to prevent reconnection loops on initial failure
+  const configuredWsMode = (process.env.CTRADER_WS_MODE || "demo").toLowerCase();
+  const isLive = configuredWsMode === "live" || (cTraderSession && cTraderSession.environment === "LIVE");
+  const environment = isLive ? "LIVE" : "DEMO";
   currentConnectedEnv = environment;
   cTraderLastDirectError = ""; // Reset last cTrader direct error for the new connection sequence
 
-  const configuredWsMode = (process.env.CTRADER_WS_MODE || "demo").toUpperCase();
-  if (configuredWsMode !== environment) {
-    addExecutionLog(
-      "WARNING",
-      "Environment Mismatch Alert",
-      `YOUR SETTINGS MAY BE MISCONFIGURED! Credentials API Endpoint Mode is set to "${configuredWsMode}", but your target authorization environment is set to "${environment}". If you have a Demo application, make sure BOTH are set to Demo; if you have a Live application, ensure BOTH are set to Live.`
-    );
-  }
-
-  let wsUrl = config.CTRADER_DEMO_WSS;
-  if (cTraderSession.tradeServerHost) {
-    const port = cTraderSession.tradeServerPort || 5035;
-    wsUrl = `wss://${cTraderSession.tradeServerHost}:${port}`;
-  } else if (environment === "LIVE") {
-    wsUrl = config.CTRADER_LIVE_WSS;
-  }
+  const wsUrl = `wss://${isLive ? "live.ctraderapi.com" : "demo.ctraderapi.com"}:5035`;
 
   addExecutionLog("INFO", "cTrader Stream Core", `Initializing binary WebSocket connection to ${wsUrl} (${environment} mode).`);
 
@@ -1142,6 +1235,11 @@ function connectToCTraderWebSocket() {
 
   try {
     cTraderWebSocket = new WebSocket(wsUrl);
+
+    cTraderWebSocket.on("error", (err) => {
+      cTraderWsStatus = "ERROR";
+      addExecutionLog("WARNING", "cTrader WS Error", `SSL stream experienced a failure: ${err.message}. Connection target was: ${wsUrl}. This usually indicates a socket timeout, DNS failure, or the target server rejected the secure handshake.`);
+    });
 
     cTraderWebSocket.on("open", () => {
       cTraderWsStatus = "OPEN";
@@ -1197,10 +1295,9 @@ This is a signature cTrader OpenAPI behavior that occurs due to one of three rea
         addExecutionLog(
           "WARNING",
           "Handshake Failed",
-          `Application Auth Failed: cTrader disconnected immediately (Code: ${code}, Reason: ${rsn || "None"}). Context: Client ID = "${cTraderSession ? cTraderSession.clientId : 'unknown'}", Environment = "${currentConnectedEnv || 'DEMO'}".${directErrorContext}`
+          `Application Auth Failed: cTrader disconnected immediately (Code: ${code}, Reason: ${rsn || "None"}). Context: Client ID = "${cTraderSession ? cTraderSession.clientId : 'unknown'}", Environment = "${currentConnectedEnv || 'DEMO'}".\n\nYour session remains authorized in memory and file. You can change/adjust your credentials below or change the API Endpoint Mode, then click "ACTIVATE STREAM" to try again.${directErrorContext}`
         );
-        cTraderSession = null;
-        isTokenValid = false;
+        // Do NOT nullify cTraderSession here! Preserve the tokens so they can adjust credentials / Endpoint Mode and reconnect.
         cTraderConnStatus = "DISCONNECTED";
         broadcastStateUpdate();
         return; // Halt here - do NOT trigger reconnection
@@ -1214,11 +1311,6 @@ This is a signature cTrader OpenAPI behavior that occurs due to one of three rea
         broadcastStateUpdate();
         triggerWsReconnection();
       }
-    });
-
-    cTraderWebSocket.on("error", (err) => {
-      cTraderWsStatus = "ERROR";
-      addExecutionLog("WARNING", "cTrader WS Error", `SSL stream experienced a failure: ${err.message}. Connection target was: ${wsUrl}. This usually indicates a socket timeout, DNS failure, or the target server rejected the secure handshake.`);
     });
   } catch (err: any) {
     cTraderWsStatus = "ERROR";
@@ -1817,33 +1909,10 @@ function handleOaMessage(data: Buffer) {
           syncState.accountMappingSuccess = true;
           broadcastStateUpdate();
 
-          // Detect if we need to switch WebSocket environment to match the target account environment (either LIVE or DEMO)
+          // Set account environment
           const activeAccount = cTraderAccounts.find(a => a.accountId === cTraderSession!.accountId) || cTraderAccounts[0];
           const targetEnv = activeAccount.isLive ? "LIVE" : "DEMO";
-          const currentEnv = currentConnectedEnv || "LIVE";
-          
-          if (targetEnv !== currentEnv) {
-            if (envSwitchCount >= 2) {
-              addExecutionLog("WARNING", "Switching Prevented", `Prevented infinite reconnection loop: already switched environments ${envSwitchCount} times. Staying on current connection.`);
-              envSwitchCount = 0;
-            } else {
-              envSwitchCount++;
-              addExecutionLog("INFO", "Switching Environment", `Account ${activeAccount.accountId} requires ${targetEnv} connection. Reconnecting to correct proxy (Switch attempt: ${envSwitchCount})...`);
-              cTraderSession!.environment = targetEnv;
-              cTraderSession!.tradeServerHost = targetEnv === "LIVE" ? "live.ctraderapi.com" : "demo.ctraderapi.com";
-              
-              if (cTraderWebSocket) {
-                cTraderWebSocket.removeAllListeners();
-                cTraderWebSocket.close();
-                cTraderWebSocket = null;
-              }
-              cTraderWsStatus = "CLOSED";
-              connectToCTraderWebSocket();
-              return;
-            }
-          } else {
-            envSwitchCount = 0; // Reset switch counter when environment is aligned
-          }
+          cTraderSession!.environment = targetEnv;
           
           addExecutionLog("INFO", "Target Account Mapped", `Mapping streaming bot to account ID: ${cTraderSession!.accountId} (${targetEnv}).`);
           sendOaAccountAuth();
@@ -2136,37 +2205,45 @@ const wss = new WebSocketServer({ noServer: true });
 wss.on("connection", (ws: WebSocket) => {
   wsClients.push(ws);
   
+  ws.on("error", (err) => {
+    console.error("[FRONTEND WS CLIENT ERROR]", err);
+  });
+
   // Send initial state immediately
-  ws.send(JSON.stringify({
-    type: "INITIAL_STATE",
-    data: {
-      account: tradingAccount,
-      connectionStatus: cTraderConnStatus,
-      websocketStatus: cTraderWsStatus,
-      positions: activePositions,
-      marketPrice: currentGoldPrice > 0 ? {
-        bid: currentGoldPrice - 0.08,
-        ask: currentGoldPrice + 0.08,
-        spread: 0.16
-      } : {
-        bid: 0,
-        ask: 0,
-        spread: 0
-      },
-      candles: goldCandles.slice(-120),
-      marketBrain,
-      executionFeed,
-      riskSettings,
-      credentials: {
-        clientId: getClientCredentials().clientId,
-        clientSecret: getClientCredentials().clientSecret ? "••••••••" : "",
-        isConfigured: !!(getClientCredentials().clientId && getClientCredentials().clientSecret)
-      },
-      cTraderAccounts,
-      activeAccountId: cTraderSession?.accountId || "",
-      diagnostics: getDiagnostics()
-    }
-  }));
+  try {
+    ws.send(JSON.stringify({
+      type: "INITIAL_STATE",
+      data: {
+        account: tradingAccount,
+        connectionStatus: cTraderConnStatus,
+        websocketStatus: cTraderWsStatus,
+        positions: activePositions,
+        marketPrice: currentGoldPrice > 0 ? {
+          bid: currentGoldPrice - 0.08,
+          ask: currentGoldPrice + 0.08,
+          spread: 0.16
+        } : {
+          bid: 0,
+          ask: 0,
+          spread: 0
+        },
+        candles: goldCandles.slice(-120),
+        marketBrain,
+        executionFeed,
+        riskSettings,
+        credentials: {
+          clientId: getClientCredentials().clientId,
+          clientSecret: getClientCredentials().clientSecret ? "••••••••" : "",
+          isConfigured: !!(getClientCredentials().clientId && getClientCredentials().clientSecret)
+        },
+        cTraderAccounts,
+        activeAccountId: cTraderSession?.accountId || "",
+        diagnostics: getDiagnostics()
+      }
+    }));
+  } catch (err) {
+    console.error("[WS CLIENT INITIAL SEND ERROR]", err);
+  }
 
   ws.on("close", () => {
     wsClients = wsClients.filter((client) => client !== ws);
@@ -2187,6 +2264,10 @@ server.on("upgrade", (request, socket, head) => {
 
 // Serve frontend assets in production and development (Vite Integration)
 async function startServer() {
+  // Load developer credentials and restored OAuth session on boot
+  loadCredentialsConfig();
+  loadSession();
+
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
